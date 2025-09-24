@@ -21,7 +21,6 @@ from pathlib import Path
 import time
 
 
-
 import streamlit as st
 
 # Display your HTML file inside the Streamlit app
@@ -29,7 +28,6 @@ with open("option_chain.html", "r") as f:
     html_code = f.read()
 
 st.components.v1.html(html_code, height=800, scrolling=True)
-
 
 # NIFTY lot size helper (checks file then env)
 def get_lot_size() -> int:
@@ -54,6 +52,77 @@ def get_lot_size() -> int:
 # Zerodha Kite settings via environment
 KITE_API_KEY = os.getenv('KITE_API_KEY')
 KITE_ACCESS_TOKEN = os.getenv('KITE_ACCESS_TOKEN')
+
+def get_intraday_bias_via_nse():
+    """
+    Fetch intraday candles for NIFTY50 from NSE API and compute:
+    VWAP, EMA9, EMA21, RSI14, Bias, Confidence.
+    """
+    url = "https://www.nseindia.com/api/chart-databyindex?index=NIFTY%2050&indices=true"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+    }
+    try:
+        session = requests.Session()
+        session.headers.update(headers)
+        resp = session.get(url, timeout=10)
+        data = resp.json()
+
+        # Prefer full candle data if present
+        candles = data.get("candles") or []
+        if candles:
+            df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+        else:
+            # Fallback to grapthData (timestamp, close only)
+            grapth = data.get("grapthData", [])
+            if not grapth:
+                return {}
+            df = pd.DataFrame(grapth, columns=["timestamp", "close"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df["volume"] = 1  # fake volume since NSE didn't provide
+
+        # Indicators
+        df["ema9"] = ta.ema(df["close"], length=9)
+        df["ema21"] = ta.ema(df["close"], length=21)
+        df["rsi14"] = ta.rsi(df["close"], length=14)
+
+        # VWAP (using available volume, else fallback to expanding mean)
+        if "volume" in df:
+            pv = (df["close"] * df["volume"]).cumsum()
+            cumvol = df["volume"].cumsum().replace(0, pd.NA)
+            df["vwap"] = pv / cumvol
+        else:
+            df["vwap"] = df["close"].expanding().mean()
+
+        last = df.iloc[-1]
+        vwap, last_price, ema9, ema21, rsi14 = last["vwap"], last["close"], last["ema9"], last["ema21"], last["rsi14"]
+
+        # Bias calculation
+        votes = 0
+        votes += 1 if last_price > vwap else -1
+        votes += 1 if ema9 > ema21 else -1
+        if rsi14 >= 60: votes += 1
+        elif rsi14 <= 40: votes -= 1
+
+        if votes >= 2: bias = "Bullish"
+        elif votes <= -2: bias = "Bearish"
+        else: bias = "Neutral"
+
+        return {
+            "vwap": round(float(vwap), 2) if pd.notna(vwap) else None,
+            "last": round(float(last_price), 2) if pd.notna(last_price) else None,
+            "ema9": round(float(ema9), 2) if pd.notna(ema9) else None,
+            "ema21": round(float(ema21), 2) if pd.notna(ema21) else None,
+            "rsi14": round(float(rsi14), 2) if pd.notna(rsi14) else None,
+            "bias": bias,
+            "confidence": abs(votes),
+        }
+    except Exception as e:
+        print("Error fetching NSE indicators:", e)
+        return {}
 
 def compute_intraday_vwap(candles):
     """
@@ -387,7 +456,7 @@ def fetch_nifty_option_chain():
 
     nifty_spot = data.get('records', {}).get('underlyingValue')
     # Try to compute intraday indicators via Kite (best effort)
-    bias_info = get_intraday_bias_via_kite()
+    bias_info =  get_daily_bias_via_kite()
     daily_info = get_daily_bias_via_kite()
     nifty_vwap = bias_info.get('vwap')
     nifty_last_from_kite = bias_info.get('last')
